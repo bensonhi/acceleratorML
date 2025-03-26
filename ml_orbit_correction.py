@@ -6,6 +6,7 @@ from typing import List
 from tqdm import tqdm
 import pickle
 import at
+import os
 
 import utils
 from sklearn.preprocessing import StandardScaler
@@ -126,13 +127,37 @@ class OrbitCorrector:
         return torch.FloatTensor(normalized_corrections).to(self.device)
 
 
-    def train(self, train_data, val_seeds, epochs=100, batch_size=32):
-        """Train the neural network with normalized data"""
+    def train(self, train_data, val_seeds, epochs=100, batch_size=32, augment_interval=1000):
+        """
+        Train the neural network with normalized data and progressive augmentation
+        
+        Args:
+            train_data: Initial training data
+            val_seeds: Seeds for validation
+            epochs: Total number of epochs
+            batch_size: Batch size for training
+            augment_interval: Interval (in epochs) to check for augmentation
+        """
         # First fit the scalers on training data
         self.fit_scalers(train_data)
 
         train_losses = []
         val_losses = []
+        
+        # Track the best validation performance
+        best_loss_improvement = 0
+        best_model_path = None
+        
+        # For tracking augmentation status
+        last_augmentation_epoch = 0
+        augmentation_counter = 0
+        has_improved_since_last_augmentation = False
+        
+        # Current training data - will grow over time
+        current_train_data = train_data.copy()
+        
+        # Create directory for saving models if it doesn't exist
+        os.makedirs('saved_models', exist_ok=True)
 
         for epoch in range(epochs):
             self.model.train()
@@ -140,8 +165,8 @@ class OrbitCorrector:
             batch_count = 0
 
             # Training loop
-            for i in range(0, len(train_data), batch_size):
-                batch = train_data[i:i + batch_size]
+            for i in range(0, len(current_train_data), batch_size):
+                batch = current_train_data[i:i + batch_size]
 
                 # Prepare normalized inputs and targets
                 inputs = torch.stack([
@@ -168,13 +193,92 @@ class OrbitCorrector:
             if(epoch+1)%50==0:
                 self.model.eval()
                 with torch.no_grad():
-                    self.validate(val_seeds)
+                    val_results = self.validate(val_seeds)
+                    
+                    # Calculate average validation metrics
+                    avg_loss_improvement = np.mean([r['loss_improvement'] for r in val_results])
+                    
+                    # Save if it's the best model so far
+                    if avg_loss_improvement > best_loss_improvement:
+                        best_loss_improvement = avg_loss_improvement
+                        model_path = f'saved_models/best_loss_model_epoch_{epoch+1}_improvement_{avg_loss_improvement:.2f}pct.pt'
+                        self.save_model_and_scalers(model_path)
+                        best_model_path = model_path
+                        has_improved_since_last_augmentation = True
+                        print(f"New best loss improvement model saved: {avg_loss_improvement:.2f}%")
+                    
+                    val_losses.append(avg_loss_improvement)
+            
+            # Check for data augmentation every augment_interval epochs
+            if (epoch + 1) % augment_interval == 0:
+                # Only augment if we've found a better model since the last augmentation
+                if has_improved_since_last_augmentation and best_model_path is not None:
+                    print(f"=== Augmenting training data at epoch {epoch+1} ===")
+                    print(f"Using best model: {best_model_path} ({best_loss_improvement:.2f}% improvement)")
+                    
+                    # Determine the seed range based on the original training data
+                    if isinstance(val_seeds, range):
+                        seed_start = 0  # Assuming we always start from 0
+                        seed_end = val_seeds.start - 1
+                    else:
+                        # Fallback if val_seeds is not a range
+                        seed_start = 0
+                        seed_end = 16000 - 1  # Default to what was in the original code
+                    
+                    # Generate augmented data using the best model
+                    new_augmented_data = self.generate_augmented_training_data(
+                        seed_range=(seed_start, seed_end),
+                        model_path=best_model_path
+                    )
+                    
+                    # Add the new augmented data to our training set
+                    augmentation_counter += 1
+                    current_train_data = np.concatenate([current_train_data, new_augmented_data])
+                    
+                    print(f"Dataset size increased: {len(current_train_data) - len(new_augmented_data)} -> {len(current_train_data)}")
+                    
+                    # Reset the flag so we only augment on improvement
+                    has_improved_since_last_augmentation = False
+                    last_augmentation_epoch = epoch + 1
+                    
+                    # Re-fit the scalers on the expanded dataset
+                    self.fit_scalers(current_train_data)
+                else:
+                    print(f"=== No model improvement since last augmentation at epoch {epoch+1} ===")
+                    print(f"Continuing training without augmentation")
 
             if (epoch + 1) % 10 == 0:
                 print(f'Epoch {epoch+1}/{epochs}:')
                 print(f'Training Loss: {avg_train_loss:.6f}')
+                print(f'Dataset size: {len(current_train_data)} samples')
+                print(f'Augmentations so far: {augmentation_counter}')
 
+        print(f"Training completed with {augmentation_counter} augmentations")
+        print(f"Final dataset size: {len(current_train_data)} samples")
         return train_losses, val_losses
+    
+    def save_model_and_scalers(self, filepath):
+        """Save model weights and fitted scalers"""
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'trajectory_scaler': self.trajectory_scaler,
+            'corrector_scaler': self.corrector_scaler,
+            'initial_corrector_scaler': self.initial_corrector_scaler
+        }, filepath)
+        
+    def load_model_and_scalers(self, filepath):
+        """Load model weights and fitted scalers from file"""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        
+        # Load model state
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Load scalers
+        self.trajectory_scaler = checkpoint['trajectory_scaler']
+        self.corrector_scaler = checkpoint['corrector_scaler']
+        self.initial_corrector_scaler = checkpoint['initial_corrector_scaler']
+        
+        print(f"Model and scalers loaded from {filepath}")
 
     def validate(self, val_seeds):
         """Test trained model on test seeds and calculate losses"""
@@ -257,3 +361,104 @@ class OrbitCorrector:
                 predictions.cpu().numpy()
             )
             return denormalized_predictions[0]
+
+    def generate_augmented_training_data(self, seed_range=(1, 100), model_path=None, cache_dir='./data_cache'):
+        """
+        Generate augmented training data by applying model predictions to seeds and using the intermediate states
+        
+        Args:
+            seed_range: Tuple of (start_seed, end_seed) inclusive
+            model_path: Path to the saved model to use for augmentation
+            cache_dir: Directory to store cached data
+        
+        Returns:
+            Augmented training data array
+        """
+        import os
+        from tqdm import tqdm
+        import multiprocessing
+        import numpy as np
+        
+        # Load the model if a path is provided
+        if model_path:
+            self.load_model_and_scalers(model_path)
+            # Extract improvement percentage from model filename
+            try:
+                improvement = float(model_path.split('improvement_')[1].split('pct.pt')[0])
+                improvement_str = f"{improvement:.2f}"
+            except:
+                improvement_str = "unknown"
+        else:
+            print("Warning: No model path provided, using current model state")
+            improvement_str = "current_model"
+        
+        # Create cache directory if it doesn't exist
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Generate cache filename based on seed range and model improvement
+        cache_file = os.path.join(
+            cache_dir, 
+            f'augmented_data_cache_{seed_range[0]}_{seed_range[1]}_model_imp_{improvement_str}pct.npz'
+        )
+        
+        # Try to load from cache first
+        if os.path.exists(cache_file):
+            print(f"Loading cached augmented data from {cache_file}")
+            cached_data = np.load(cache_file, allow_pickle=True)
+            return cached_data['augmented_data']
+        
+        print(f"Generating augmented training data for seeds {seed_range[0]} to {seed_range[1]}")
+        
+        # Process each seed sequentially (since we need the model)
+        augmented_data = []
+        
+        for seed_num in tqdm(range(seed_range[0], seed_range[1] + 1), 
+                             desc="Generating augmented data", unit="seed"):
+            try:
+                # Load pre and post correction rings
+                seed_file = f'./matlab/seeds/seed{seed_num:d}.mat'
+                pre_ring = at.load_mat(seed_file, check=False, use="preCorrection")
+                post_ring = at.load_mat(seed_file, check=False, use="postCorrection")
+                
+                # Get BPM readings and initial corrector values from pre-correction ring
+                bpm_readings, _ = utils.getBPMreading(pre_ring)
+                initial_hcm = utils.getCorrectorStrengths(pre_ring, 'x')
+                initial_vcm = utils.getCorrectorStrengths(pre_ring, 'y')
+                initial_correctors = np.concatenate([initial_hcm, initial_vcm])
+                
+                # Get target corrector values from post-correction ring (our label)
+                target_hcm = utils.getCorrectorStrengths(post_ring, 'x')
+                target_vcm = utils.getCorrectorStrengths(post_ring, 'y')
+                target_corrections = np.concatenate([target_hcm, target_vcm])
+                
+                # Get model predictions for corrector settings
+                predicted_corrections = self.predict_corrections(bpm_readings, initial_correctors)
+                
+                # Apply predicted corrections to create intermediate state
+                augmented_ring = pre_ring.copy()
+                augmented_ring = utils.setCorrectorStrengths(augmented_ring, 'x', 
+                                                            predicted_corrections[:len(self.hcm)])
+                augmented_ring = utils.setCorrectorStrengths(augmented_ring, 'y', 
+                                                            predicted_corrections[len(self.hcm):])
+                
+                # Get new BPM readings from intermediate state
+                augmented_bpm_readings, _ = utils.getBPMreading(augmented_ring)
+                
+                # Store as new training sample:
+                # input: augmented_bpm_readings, predicted_corrections
+                # target: target_corrections
+                augmented_data.append([augmented_bpm_readings, predicted_corrections, target_corrections])
+                
+            except FileNotFoundError:
+                print(f"Skipping seed {seed_num} - files not found")
+                continue
+            except Exception as e:
+                print(f"Error processing seed {seed_num}: {str(e)}")
+                continue
+        
+        # Save to cache
+        augmented_data = np.array(augmented_data, dtype=object)
+        print(f"Saving augmented data cache to {cache_file}")
+        np.savez(cache_file, augmented_data=augmented_data)
+        
+        return augmented_data

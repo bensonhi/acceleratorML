@@ -268,7 +268,21 @@ class OrbitCorrector:
         
     def load_model_and_scalers(self, filepath):
         """Load model weights and fitted scalers from file"""
-        checkpoint = torch.load(filepath, map_location=self.device)
+        try:
+            # Option 1: Add StandardScaler to safe globals (recommended approach)
+            import torch.serialization
+            
+            # Add StandardScaler to the list of safe globals
+            torch.serialization.add_safe_globals([StandardScaler])
+            
+            # Then load the checkpoint
+            checkpoint = torch.load(filepath, map_location=self.device)
+            
+        except Exception as e:
+            # Option 2: Fallback to weights_only=False (less secure but works with older PyTorch)
+            print(f"Error with safe loading: {e}")
+            print("Falling back to weights_only=False loading method")
+            checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
         
         # Load model state
         self.model.load_state_dict(checkpoint['model_state_dict'])

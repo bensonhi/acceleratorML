@@ -10,6 +10,7 @@ import os
 
 import utils
 from sklearn.preprocessing import StandardScaler
+from multiprocessing import Manager
 
 class OrbitCorrectionNN(nn.Module):
     def __init__(self, n_elements: int, n_correctors: int, dropout_rate: float = 0.5):
@@ -439,28 +440,59 @@ class OrbitCorrector:
         tmp_model_path = os.path.join(cache_dir, f'tmp_model_for_augmentation_{improvement_str}.pt')
         self.save_model_and_scalers(tmp_model_path)
         
-        # Run workers in parallel with improved progress tracking
+        # Create a shared counter for progress tracking
+        manager = Manager()
+        progress_dict = manager.dict()
+        progress_dict['completed'] = 0
+        progress_dict['successful'] = 0
+        
+        # Run workers with shared progress tracking
         augmented_data = []
-        processed_count = 0
         start_time = time.time()
         
         # Create a progress bar for the overall process
         with tqdm(total=total_seeds, desc="Augmenting data", unit="seed") as pbar:
             with multiprocessing.Pool(processes=min(num_workers, len(seed_batches))) as pool:
-                # Prepare worker arguments
-                worker_args = [(batch[0], batch[1], tmp_model_path, self.base_ring) for batch in seed_batches]
+                # Prepare worker arguments with progress_dict
+                worker_args = [(batch[0], batch[1], tmp_model_path, self.base_ring, progress_dict) 
+                              for batch in seed_batches]
                 
-                # Process batches and update progress bar
-                for results, count in pool.imap_unordered(_augment_worker_process, worker_args):
-                    augmented_data.extend(results)
-                    processed_count += count
-                    # Update progress bar based on processed seeds
-                    pbar.update(batch_size)  # Approximate update
-                    pbar.set_postfix({"Completed": processed_count, "Success Rate": f"{100*processed_count/pbar.n:.1f}%"})
+                # Start all worker processes asynchronously
+                result_objects = [pool.apply_async(_augment_worker_process, args=(arg,)) 
+                                 for arg in worker_args]
+                
+                # Monitor progress while workers are running
+                last_update = 0
+                while True:
+                    # Check if all workers are done
+                    if all(result.ready() for result in result_objects):
+                        break
+                    
+                    # Update progress bar based on shared counter
+                    current = progress_dict['completed']
+                    if current > last_update:
+                        pbar.update(current - last_update)
+                        last_update = current
+                        
+                        # Update additional stats
+                        if current > 0:
+                            success_rate = 100 * progress_dict['successful'] / current
+                            pbar.set_postfix({
+                                "Completed": current, 
+                                "Success %": f"{success_rate:.1f}%"
+                            })
+                    
+                    # Don't hog CPU with constant checking
+                    time.sleep(0.1)
+                
+                # Process results from all workers when complete
+                for result_obj in result_objects:
+                    worker_results = result_obj.get()
+                    augmented_data.extend(worker_results)
         
         # Display summary statistics
         elapsed_time = time.time() - start_time
-        seeds_per_second = processed_count / elapsed_time
+        seeds_per_second = len(augmented_data) / elapsed_time
         print(f"Augmentation completed in {elapsed_time:.1f} seconds ({seeds_per_second:.1f} seeds/second)")
         
         # Clean up temporary model file
@@ -479,10 +511,9 @@ class OrbitCorrector:
 # Add this function at the module level (outside any class)
 def _augment_worker_process(args):
     """
-    Worker function for parallel data augmentation.
-    Must be at module level to be picklable for multiprocessing.
+    Worker function for parallel data augmentation with progress reporting.
     """
-    start_seed, end_seed, tmp_model_path, base_ring = args
+    start_seed, end_seed, tmp_model_path, base_ring, progress_dict = args
     
     # Create a new OrbitCorrector instance for this worker
     worker_corrector = OrbitCorrector(base_ring, device='cpu')
@@ -539,8 +570,16 @@ def _augment_worker_process(args):
             # Store as new training sample
             worker_results.append([augmented_bpm_readings, predicted_corrections, target_corrections])
             
+            # Update shared progress counter - count successful processing
+            with progress_dict.get_lock():
+                progress_dict['completed'] += 1
+                progress_dict['successful'] += 1
+            
         except Exception as e:
             print(f"Worker error processing seed {seed_num}: {str(e)}")
+            # Update shared progress counter - count attempted processing
+            with progress_dict.get_lock():
+                progress_dict['completed'] += 1
             continue
             
-    return worker_results, len(worker_results)
+    return worker_results

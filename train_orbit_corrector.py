@@ -93,7 +93,7 @@ def main():
     logger.info("Generating training data...")
 
     train_seeds = range(16000)
-    val_seeds = range(16000, 16100)
+    val_seeds = range(16000, 16010)
     test_seeds = range(18000, 18100)
     
     train_data = generate_training_data(seed_range=(train_seeds.start, train_seeds.stop - 1))
@@ -107,8 +107,8 @@ def main():
     corrector.train(
         train_data=train_data,
         val_seeds=val_seeds,
-        epochs=500,
-        batch_size=128
+        epochs=10000,
+        batch_size=1024
     )
 
     logger.info("Testing model...")

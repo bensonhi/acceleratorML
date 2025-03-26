@@ -18,25 +18,16 @@ class OrbitCorrectionNN(nn.Module):
         # Calculate input size including initial corrector values
         input_size = n_elements * 2 + n_correctors
 
-        # Define network architecture
         self.network = nn.Sequential(
-            # First layer
-            nn.Linear(input_size, 4096),
-            nn.BatchNorm1d(4096),
-            nn.ReLU(),
-
-            # Second layer
-            nn.Linear(4096, 2048),
-            nn.BatchNorm1d(2048),
-            nn.ReLU(),
-
-            # Third layer
-            nn.Linear(2048, 1024),
+            nn.Linear(input_size, 1024),
             nn.BatchNorm1d(1024),
-            nn.ReLU(),
+            nn.LeakyReLU(negative_slope=0.01),
 
-            # Output layer
-            nn.Linear(1024, n_correctors),
+            nn.Linear(1024, 512),
+            nn.BatchNorm1d(512),
+            nn.LeakyReLU(negative_slope=0.01),
+
+            nn.Linear(512, n_correctors)
         )
 
         self._initialize_weights()
@@ -45,9 +36,9 @@ class OrbitCorrectionNN(nn.Module):
         """Initialize network weights using Xavier initialization"""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
+                nn.init.kaiming_normal_(m.weight, nonlinearity='leaky_relu')
                 if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                    nn.init.zeros_(m.bias)
 
     def forward(self, x):
         return self.network(x)
@@ -202,15 +193,6 @@ class OrbitCorrector:
                 initial_rms = utils.rms(np.concatenate(T0))
                 initial_loss = utils.rms(B0)
 
-                # Get expected metrics
-                target_hcm = utils.getCorrectorStrengths(post_ring, 'x')
-                target_vcm = utils.getCorrectorStrengths(post_ring, 'y')
-                pre_ring = utils.setCorrectorStrengths(pre_ring, 'x',target_hcm)
-                pre_ring = utils.setCorrectorStrengths(pre_ring, 'y',target_vcm)
-                [B1, T1] = utils.getBPMreading(pre_ring)
-                expected_rms = utils.rms(np.concatenate(T1))
-                expected_loss = utils.rms(B1)
-
 
                 # Get current trajectory
                 initial_hcm = utils.getCorrectorStrengths(pre_ring, 'x')
@@ -218,7 +200,7 @@ class OrbitCorrector:
                 initial_correctors = np.concatenate([initial_hcm, initial_vcm])
 
                 # Get model predictions for corrector settings
-                predicted_corrections = self.predict_corrections(T0, initial_correctors)
+                predicted_corrections = self.predict_corrections(B0, initial_correctors)
 
                 # Apply predicted corrections
                 pre_ring = utils.setCorrectorStrengths(pre_ring, 'x',
@@ -231,6 +213,16 @@ class OrbitCorrector:
 
                 new_rms = utils.rms(np.concatenate(T_new))
                 new_loss = utils.rms(B_new)
+
+
+                # Get expected metrics
+                target_hcm = utils.getCorrectorStrengths(post_ring, 'x')
+                target_vcm = utils.getCorrectorStrengths(post_ring, 'y')
+                pre_ring = utils.setCorrectorStrengths(pre_ring, 'x',target_hcm)
+                pre_ring = utils.setCorrectorStrengths(pre_ring, 'y',target_vcm)
+                [B1, T1] = utils.getBPMreading(pre_ring)
+                expected_rms = utils.rms(np.concatenate(T1))
+                expected_loss = utils.rms(B1)
 
 
                 results.append({

@@ -299,6 +299,9 @@ class OrbitCorrector:
         """Test trained model on test seeds and calculate losses using multiprocessing"""
         import multiprocessing
         
+        # Set multiprocessing start method to 'spawn' to avoid CUDA issues
+        multiprocessing.set_start_method('spawn', force=True)
+        
         # Prepare arguments for parallel processing
         worker_args = [(seed_num, self) for seed_num in val_seeds]
         

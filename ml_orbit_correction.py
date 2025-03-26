@@ -228,7 +228,8 @@ class OrbitCorrector:
                     # Generate augmented data using the best model
                     new_augmented_data = self.generate_augmented_training_data(
                         seed_range=(seed_start, seed_end),
-                        model_path=best_model_path
+                        model_path=best_model_path,
+                        num_workers=12  # Use 12 cores
                     )
                     
                     # Add the new augmented data to our training set
@@ -376,14 +377,15 @@ class OrbitCorrector:
             )
             return denormalized_predictions[0]
 
-    def generate_augmented_training_data(self, seed_range=(1, 100), model_path=None, cache_dir='./data_cache'):
+    def generate_augmented_training_data(self, seed_range=(1, 100), model_path=None, cache_dir='./data_cache', num_workers=13):
         """
-        Generate augmented training data by applying model predictions to seeds and using the intermediate states
+        Generate augmented training data in parallel using multiple CPU cores
         
         Args:
             seed_range: Tuple of (start_seed, end_seed) inclusive
             model_path: Path to the saved model to use for augmentation
             cache_dir: Directory to store cached data
+            num_workers: Number of CPU cores to use for parallelization
         
         Returns:
             Augmented training data array
@@ -421,54 +423,90 @@ class OrbitCorrector:
             cached_data = np.load(cache_file, allow_pickle=True)
             return cached_data['augmented_data']
         
-        print(f"Generating augmented training data for seeds {seed_range[0]} to {seed_range[1]}")
+        print(f"Generating augmented training data for seeds {seed_range[0]} to {seed_range[1]} using {num_workers} workers")
         
-        # Process each seed sequentially (since we need the model)
+        # Create batches of seeds for parallelization
+        total_seeds = seed_range[1] - seed_range[0] + 1
+        batch_size = max(1, total_seeds // num_workers)
+        seed_batches = []
+        
+        for i in range(seed_range[0], seed_range[1] + 1, batch_size):
+            end = min(i + batch_size - 1, seed_range[1])
+            seed_batches.append((i, end))
+        
+        # Save current model state to a temporary file for workers to load
+        tmp_model_path = os.path.join(cache_dir, f'tmp_model_for_augmentation_{improvement_str}.pt')
+        self.save_model_and_scalers(tmp_model_path)
+        
+        # Define worker function for augmentation (needs to be at module level to be picklable)
+        def augment_worker(args):
+            start_seed, end_seed, tmp_model = args
+            
+            # Create a new OrbitCorrector instance for this worker
+            worker_corrector = OrbitCorrector(self.base_ring, device='cpu')
+            
+            # Load the model and scalers
+            worker_corrector.load_model_and_scalers(tmp_model)
+            
+            worker_results = []
+            
+            for seed_num in range(start_seed, end_seed + 1):
+                try:
+                    # Load pre and post correction rings
+                    seed_file = f'./matlab/seeds/seed{seed_num:d}.mat'
+                    pre_ring = at.load_mat(seed_file, check=False, use="preCorrection")
+                    post_ring = at.load_mat(seed_file, check=False, use="postCorrection")
+                    
+                    # Get BPM readings and initial corrector values from pre-correction ring
+                    bpm_readings, _ = utils.getBPMreading(pre_ring)
+                    initial_hcm = utils.getCorrectorStrengths(pre_ring, 'x')
+                    initial_vcm = utils.getCorrectorStrengths(pre_ring, 'y')
+                    initial_correctors = np.concatenate([initial_hcm, initial_vcm])
+                    
+                    # Get target corrector values from post-correction ring (our label)
+                    target_hcm = utils.getCorrectorStrengths(post_ring, 'x')
+                    target_vcm = utils.getCorrectorStrengths(post_ring, 'y')
+                    target_corrections = np.concatenate([target_hcm, target_vcm])
+                    
+                    # Get model predictions for corrector settings
+                    predicted_corrections = worker_corrector.predict_corrections(bpm_readings, initial_correctors)
+                    
+                    # Apply predicted corrections to create intermediate state
+                    augmented_ring = pre_ring.copy()
+                    augmented_ring = utils.setCorrectorStrengths(augmented_ring, 'x', 
+                                                                predicted_corrections[:len(worker_corrector.hcm)])
+                    augmented_ring = utils.setCorrectorStrengths(augmented_ring, 'y', 
+                                                                predicted_corrections[len(worker_corrector.hcm):])
+                    
+                    # Get new BPM readings from intermediate state
+                    augmented_bpm_readings, _ = utils.getBPMreading(augmented_ring)
+                    
+                    # Store as new training sample
+                    worker_results.append([augmented_bpm_readings, predicted_corrections, target_corrections])
+                    
+                except Exception as e:
+                    print(f"Worker error processing seed {seed_num}: {str(e)}")
+                    continue
+                
+            return worker_results
+        
+        # Run workers in parallel
         augmented_data = []
+        with multiprocessing.Pool(processes=min(num_workers, len(seed_batches))) as pool:
+            worker_args = [(batch[0], batch[1], tmp_model_path) for batch in seed_batches]
+            results = list(tqdm(
+                pool.imap(augment_worker, worker_args),
+                total=len(worker_args),
+                desc="Processing batches in parallel"
+            ))
+            
+            # Combine results from all workers
+            for worker_result in results:
+                augmented_data.extend(worker_result)
         
-        for seed_num in tqdm(range(seed_range[0], seed_range[1] + 1), 
-                             desc="Generating augmented data", unit="seed"):
-            try:
-                # Load pre and post correction rings
-                seed_file = f'./matlab/seeds/seed{seed_num:d}.mat'
-                pre_ring = at.load_mat(seed_file, check=False, use="preCorrection")
-                post_ring = at.load_mat(seed_file, check=False, use="postCorrection")
-                
-                # Get BPM readings and initial corrector values from pre-correction ring
-                bpm_readings, _ = utils.getBPMreading(pre_ring)
-                initial_hcm = utils.getCorrectorStrengths(pre_ring, 'x')
-                initial_vcm = utils.getCorrectorStrengths(pre_ring, 'y')
-                initial_correctors = np.concatenate([initial_hcm, initial_vcm])
-                
-                # Get target corrector values from post-correction ring (our label)
-                target_hcm = utils.getCorrectorStrengths(post_ring, 'x')
-                target_vcm = utils.getCorrectorStrengths(post_ring, 'y')
-                target_corrections = np.concatenate([target_hcm, target_vcm])
-                
-                # Get model predictions for corrector settings
-                predicted_corrections = self.predict_corrections(bpm_readings, initial_correctors)
-                
-                # Apply predicted corrections to create intermediate state
-                augmented_ring = pre_ring.copy()
-                augmented_ring = utils.setCorrectorStrengths(augmented_ring, 'x', 
-                                                            predicted_corrections[:len(self.hcm)])
-                augmented_ring = utils.setCorrectorStrengths(augmented_ring, 'y', 
-                                                            predicted_corrections[len(self.hcm):])
-                
-                # Get new BPM readings from intermediate state
-                augmented_bpm_readings, _ = utils.getBPMreading(augmented_ring)
-                
-                # Store as new training sample:
-                # input: augmented_bpm_readings, predicted_corrections
-                # target: target_corrections
-                augmented_data.append([augmented_bpm_readings, predicted_corrections, target_corrections])
-                
-            except FileNotFoundError:
-                print(f"Skipping seed {seed_num} - files not found")
-                continue
-            except Exception as e:
-                print(f"Error processing seed {seed_num}: {str(e)}")
-                continue
+        # Clean up temporary model file
+        if os.path.exists(tmp_model_path):
+            os.remove(tmp_model_path)
         
         # Save to cache
         augmented_data = np.array(augmented_data, dtype=object)

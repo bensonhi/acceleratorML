@@ -296,66 +296,24 @@ class OrbitCorrector:
         print(f"Model and scalers loaded from {filepath}")
 
     def validate(self, val_seeds):
-        """Test trained model on test seeds and calculate losses"""
-        results = []
-        pbar = tqdm(val_seeds, desc="Testing model")
-        for seed_num in pbar:
-            # Load pre and post correction rings
-            lattice_file = f"./matlab/seeds/seed{seed_num:d}.mat"
-
-            try:
-                pre_ring = at.load_mat(lattice_file, check=False, use="preCorrection")
-                post_ring = at.load_mat(lattice_file, check=False, use="postCorrection")
-
-                # Get initial state
-                [B0, T0] = utils.getBPMreading(pre_ring)
-                initial_rms = utils.rms(np.concatenate(T0))
-                initial_loss = utils.rms(B0)
-
-
-                # Get current trajectory
-                initial_hcm = utils.getCorrectorStrengths(pre_ring, 'x')
-                initial_vcm = utils.getCorrectorStrengths(pre_ring, 'y')
-                initial_correctors = np.concatenate([initial_hcm, initial_vcm])
-
-                # Get model predictions for corrector settings
-                predicted_corrections = self.predict_corrections(B0, initial_correctors)
-
-                # Apply predicted corrections
-                pre_ring = utils.setCorrectorStrengths(pre_ring, 'x',
-                                                           predicted_corrections[:len(self.hcm)])
-                pre_ring = utils.setCorrectorStrengths(pre_ring, 'y',
-                                                           predicted_corrections[len(self.hcm):])
-
-                # Measure new state
-                [B_new, T_new] = utils.getBPMreading(pre_ring)
-
-                new_rms = utils.rms(np.concatenate(T_new))
-                new_loss = utils.rms(B_new)
-
-
-                # Get expected metrics
-                target_hcm = utils.getCorrectorStrengths(post_ring, 'x')
-                target_vcm = utils.getCorrectorStrengths(post_ring, 'y')
-                pre_ring = utils.setCorrectorStrengths(pre_ring, 'x',target_hcm)
-                pre_ring = utils.setCorrectorStrengths(pre_ring, 'y',target_vcm)
-                [B1, T1] = utils.getBPMreading(pre_ring)
-                expected_rms = utils.rms(np.concatenate(T1))
-                expected_loss = utils.rms(B1)
-
-
-                results.append({
-                    'seed': seed_num,
-                    'rms_improvement': ((initial_rms - new_rms) / initial_rms) * 100,
-                    'expected rms_improvement': ((initial_rms - expected_rms) / initial_rms) * 100,
-                    'loss_improvement': ((initial_loss - new_loss) / initial_loss) * 100,
-                    'expected loss_improvement': ((initial_loss - expected_loss) / initial_loss) * 100,
-                })
-
-            except Exception as e:
-                print(f"Error processing seed {seed_num}: {str(e)}")
-                continue
-
+        """Test trained model on test seeds and calculate losses using multiprocessing"""
+        import multiprocessing
+        
+        # Prepare arguments for parallel processing
+        worker_args = [(seed_num, self) for seed_num in val_seeds]
+        
+        # Use multiprocessing to validate seeds in parallel
+        with multiprocessing.Pool(processes=os.cpu_count()) as pool:
+            results = list(tqdm(
+                pool.imap(_validate_worker, worker_args),
+                total=len(val_seeds),
+                desc="Testing model"
+            ))
+        
+        # Filter out None results (failed seeds)
+        results = [r for r in results if r is not None]
+        
+        # Print summary statistics
         print("total rms improvement:" + str(np.mean([r['rms_improvement'] for r in results])) + "%")
         print("expected rms improvement:" + str(np.mean([r['expected rms_improvement'] for r in results])) + "%")
         print("total loss improvement:" + str(np.mean([r['loss_improvement'] for r in results])) + "%")
@@ -544,3 +502,60 @@ def _augment_worker_process(args):
             continue
             
     return worker_results, len(worker_results)
+
+# Add this function at module level for multiprocessing
+def _validate_worker(args):
+    """Worker function for parallel validation processing"""
+    seed_num, corrector = args
+    
+    try:
+        # Load pre and post correction rings
+        lattice_file = f"./matlab/seeds/seed{seed_num:d}.mat"
+        pre_ring = at.load_mat(lattice_file, check=False, use="preCorrection")
+        post_ring = at.load_mat(lattice_file, check=False, use="postCorrection")
+
+        # Get initial state
+        [B0, T0] = utils.getBPMreading(pre_ring)
+        initial_rms = utils.rms(np.concatenate(T0))
+        initial_loss = utils.rms(B0)
+
+        # Get current trajectory
+        initial_hcm = utils.getCorrectorStrengths(pre_ring, 'x')
+        initial_vcm = utils.getCorrectorStrengths(pre_ring, 'y')
+        initial_correctors = np.concatenate([initial_hcm, initial_vcm])
+
+        # Get model predictions for corrector settings
+        predicted_corrections = corrector.predict_corrections(B0, initial_correctors)
+
+        # Apply predicted corrections
+        pre_ring = utils.setCorrectorStrengths(pre_ring, 'x',
+                                                predicted_corrections[:len(corrector.hcm)])
+        pre_ring = utils.setCorrectorStrengths(pre_ring, 'y',
+                                                predicted_corrections[len(corrector.hcm):])
+
+        # Measure new state
+        [B_new, T_new] = utils.getBPMreading(pre_ring)
+
+        new_rms = utils.rms(np.concatenate(T_new))
+        new_loss = utils.rms(B_new)
+
+        # Get expected metrics
+        target_hcm = utils.getCorrectorStrengths(post_ring, 'x')
+        target_vcm = utils.getCorrectorStrengths(post_ring, 'y')
+        pre_ring = utils.setCorrectorStrengths(pre_ring, 'x',target_hcm)
+        pre_ring = utils.setCorrectorStrengths(pre_ring, 'y',target_vcm)
+        [B1, T1] = utils.getBPMreading(pre_ring)
+        expected_rms = utils.rms(np.concatenate(T1))
+        expected_loss = utils.rms(B1)
+
+        return {
+            'seed': seed_num,
+            'rms_improvement': ((initial_rms - new_rms) / initial_rms) * 100,
+            'expected rms_improvement': ((initial_rms - expected_rms) / initial_rms) * 100,
+            'loss_improvement': ((initial_loss - new_loss) / initial_loss) * 100,
+            'expected loss_improvement': ((initial_loss - expected_loss) / initial_loss) * 100,
+        }
+
+    except Exception as e:
+        print(f"Error processing seed {seed_num}: {str(e)}")
+        return None

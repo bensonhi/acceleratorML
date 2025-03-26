@@ -296,73 +296,97 @@ class OrbitCorrector:
         
         print(f"Model and scalers loaded from {filepath}")
 
-    def validate(self, val_seeds):
-        """Test trained model on test seeds and calculate losses"""
-        results = []
-        pbar = tqdm(val_seeds, desc="Testing model")
-        for seed_num in pbar:
-            # Load pre and post correction rings
-            lattice_file = f"./matlab/seeds/seed{seed_num:d}.mat"
-
-            try:
-                pre_ring = at.load_mat(lattice_file, check=False, use="preCorrection")
-                post_ring = at.load_mat(lattice_file, check=False, use="postCorrection")
-
-                # Get initial state
-                [B0, T0] = utils.getBPMreading(pre_ring)
-                initial_rms = utils.rms(np.concatenate(T0))
-                initial_loss = utils.rms(B0)
 
 
-                # Get current trajectory
-                initial_hcm = utils.getCorrectorStrengths(pre_ring, 'x')
-                initial_vcm = utils.getCorrectorStrengths(pre_ring, 'y')
-                initial_correctors = np.concatenate([initial_hcm, initial_vcm])
-
-                # Get model predictions for corrector settings
-                predicted_corrections = self.predict_corrections(B0, initial_correctors)
-
-                # Apply predicted corrections
-                pre_ring = utils.setCorrectorStrengths(pre_ring, 'x',
-                                                           predicted_corrections[:len(self.hcm)])
-                pre_ring = utils.setCorrectorStrengths(pre_ring, 'y',
-                                                           predicted_corrections[len(self.hcm):])
-
-                # Measure new state
-                [B_new, T_new] = utils.getBPMreading(pre_ring)
-
-                new_rms = utils.rms(np.concatenate(T_new))
-                new_loss = utils.rms(B_new)
-
-
-                # Get expected metrics
-                target_hcm = utils.getCorrectorStrengths(post_ring, 'x')
-                target_vcm = utils.getCorrectorStrengths(post_ring, 'y')
-                pre_ring = utils.setCorrectorStrengths(pre_ring, 'x',target_hcm)
-                pre_ring = utils.setCorrectorStrengths(pre_ring, 'y',target_vcm)
-                [B1, T1] = utils.getBPMreading(pre_ring)
-                expected_rms = utils.rms(np.concatenate(T1))
-                expected_loss = utils.rms(B1)
-
-
-                results.append({
-                    'seed': seed_num,
-                    'rms_improvement': ((initial_rms - new_rms) / initial_rms) * 100,
-                    'expected rms_improvement': ((initial_rms - expected_rms) / initial_rms) * 100,
-                    'loss_improvement': ((initial_loss - new_loss) / initial_loss) * 100,
-                    'expected loss_improvement': ((initial_loss - expected_loss) / initial_loss) * 100,
-                })
-
-            except Exception as e:
-                print(f"Error processing seed {seed_num}: {str(e)}")
-                continue
-
-        print("total rms improvement:" + str(np.mean([r['rms_improvement'] for r in results])) + "%")
-        print("expected rms improvement:" + str(np.mean([r['expected rms_improvement'] for r in results])) + "%")
-        print("total loss improvement:" + str(np.mean([r['loss_improvement'] for r in results])) + "%")
-        print("expected loss improvement:" + str(np.mean([r['expected loss_improvement'] for r in results])) + "%")
-
-        return results
+    def validate_parallel(self, val_seeds, num_workers=8):
+        """Test trained model on test seeds using parallel processing
+        
+        Args:
+            val_seeds: List or range of seed numbers to validate
+            num_workers: Number of CPU cores to use
+            
+        Returns:
+            List of dictionaries with validation results for each seed
+        """
+        import os
+        import multiprocessing
+        from tqdm import tqdm
+        
+        # Save current model state to a temporary file for workers to load
+        tmp_model_path = os.path.join('saved_models', f'tmp_model_for_validation.pt')
+        self.save_model_and_scalers(tmp_model_path)
+        
+        # Create a shared manager for progress tracking
+        manager = multiprocessing.Manager()
+        progress_dict = manager.dict()
+        progress_dict['completed'] = 0
+        progress_dict['successful'] = 0
+        
+        # Create seed batches for parallel processing
+        total_seeds = len(val_seeds) if not isinstance(val_seeds, range) else val_seeds.stop - val_seeds.start
+        seed_list = list(val_seeds)
+        batch_size = max(1, len(seed_list) // num_workers)
+        seed_batches = []
+        
+        for i in range(0, len(seed_list), batch_size):
+            end = min(i + batch_size, len(seed_list))
+            seed_batches.append(seed_list[i:end])
+        
+        print(f"Validating {total_seeds} seeds using {num_workers} workers")
+        
+        # Execute validation in parallel
+        all_results = []
+        with tqdm(total=total_seeds, desc="Validating model", unit="seed") as pbar:
+            with multiprocessing.Pool(processes=min(num_workers, len(seed_batches))) as pool:
+                # Prepare worker arguments
+                worker_args = [(batch, tmp_model_path, self.base_ring, progress_dict) 
+                              for batch in seed_batches]
+                
+                # Start all worker processes asynchronously
+                result_objects = [pool.apply_async(_validate_worker_process, args=(arg,)) 
+                                 for arg in worker_args]
+                
+                # Monitor progress while workers are running
+                last_update = 0
+                while True:
+                    # Check if all workers are done
+                    if all(result.ready() for result in result_objects):
+                        break
+                    
+                    # Update progress bar based on shared counter
+                    current = progress_dict['completed']
+                    if current > last_update:
+                        pbar.update(current - last_update)
+                        last_update = current
+                        
+                        # Update additional stats
+                        if current > 0:
+                            success_rate = 100 * progress_dict['successful'] / current
+                            pbar.set_postfix({
+                                "Completed": current, 
+                                "Success %": f"{success_rate:.1f}%"
+                            })
+                    
+                    # Don't hog CPU with constant checking
+                    import time
+                    time.sleep(0.1)
+                
+                # Process results from all workers when complete
+                for result_obj in result_objects:
+                    worker_results = result_obj.get()
+                    all_results.extend(worker_results)
+        
+        # Clean up temporary model file
+        if os.path.exists(tmp_model_path):
+            os.remove(tmp_model_path)
+        
+        # Print summary statistics
+        print("total rms improvement:" + str(np.mean([r['rms_improvement'] for r in all_results])) + "%")
+        print("expected rms improvement:" + str(np.mean([r['expected rms_improvement'] for r in all_results])) + "%")
+        print("total loss improvement:" + str(np.mean([r['loss_improvement'] for r in all_results])) + "%")
+        print("expected loss improvement:" + str(np.mean([r['expected loss_improvement'] for r in all_results])) + "%")
+        
+        return all_results
 
     def predict_corrections(self, true_trajectory: List[np.ndarray], initial_correctors: np.ndarray) -> np.ndarray:
         """Predict corrector values with proper denormalization"""
@@ -582,4 +606,93 @@ def _augment_worker_process(args):
                 progress_dict['completed'] += 1
             continue
             
+    return worker_results
+
+# Add this function at the module level (outside any class)
+def _validate_worker_process(args):
+    """
+    Worker function for parallel validation with progress reporting.
+    """
+    seed_batch, tmp_model_path, base_ring, progress_dict = args
+    
+    # Create a new OrbitCorrector instance for this worker
+    worker_corrector = OrbitCorrector(base_ring, device='cpu')
+    
+    # Load the model and scalers
+    try:
+        from sklearn.preprocessing import StandardScaler
+        import torch.serialization
+        torch.serialization.add_safe_globals([StandardScaler])
+        checkpoint = torch.load(tmp_model_path, map_location='cpu')
+    except:
+        checkpoint = torch.load(tmp_model_path, map_location='cpu', weights_only=False)
+    
+    # Load model and scalers manually
+    worker_corrector.model.load_state_dict(checkpoint['model_state_dict'])
+    worker_corrector.trajectory_scaler = checkpoint['trajectory_scaler']
+    worker_corrector.corrector_scaler = checkpoint['corrector_scaler']
+    worker_corrector.initial_corrector_scaler = checkpoint['initial_corrector_scaler']
+    
+    worker_results = []
+    
+    # Process each seed in this worker's batch
+    for seed_num in seed_batch:
+        try:
+            # Load pre and post correction rings
+            lattice_file = f"./matlab/seeds/seed{seed_num:d}.mat"
+            pre_ring = at.load_mat(lattice_file, check=False, use="preCorrection")
+            post_ring = at.load_mat(lattice_file, check=False, use="postCorrection")
+
+            # Get initial state
+            [B0, T0] = utils.getBPMreading(pre_ring)
+            initial_rms = utils.rms(np.concatenate(T0))
+            initial_loss = utils.rms(B0)
+
+            # Get current trajectory
+            initial_hcm = utils.getCorrectorStrengths(pre_ring, 'x')
+            initial_vcm = utils.getCorrectorStrengths(pre_ring, 'y')
+            initial_correctors = np.concatenate([initial_hcm, initial_vcm])
+
+            # Get model predictions for corrector settings
+            predicted_corrections = worker_corrector.predict_corrections(B0, initial_correctors)
+
+            # Apply predicted corrections
+            pre_ring = utils.setCorrectorStrengths(pre_ring, 'x',
+                                                predicted_corrections[:len(worker_corrector.hcm)])
+            pre_ring = utils.setCorrectorStrengths(pre_ring, 'y',
+                                                predicted_corrections[len(worker_corrector.hcm):])
+
+            # Measure new state
+            [B_new, T_new] = utils.getBPMreading(pre_ring)
+            new_rms = utils.rms(np.concatenate(T_new))
+            new_loss = utils.rms(B_new)
+
+            # Get expected metrics
+            target_hcm = utils.getCorrectorStrengths(post_ring, 'x')
+            target_vcm = utils.getCorrectorStrengths(post_ring, 'y')
+            pre_ring = utils.setCorrectorStrengths(pre_ring, 'x', target_hcm)
+            pre_ring = utils.setCorrectorStrengths(pre_ring, 'y', target_vcm)
+            [B1, T1] = utils.getBPMreading(pre_ring)
+            expected_rms = utils.rms(np.concatenate(T1))
+            expected_loss = utils.rms(B1)
+
+            worker_results.append({
+                'seed': seed_num,
+                'rms_improvement': ((initial_rms - new_rms) / initial_rms) * 100,
+                'expected rms_improvement': ((initial_rms - expected_rms) / initial_rms) * 100,
+                'loss_improvement': ((initial_loss - new_loss) / initial_loss) * 100,
+                'expected loss_improvement': ((initial_loss - expected_loss) / initial_loss) * 100,
+            })
+            
+            # Update shared progress counter - count successful processing
+            with progress_dict.get_lock():
+                progress_dict['completed'] += 1
+                progress_dict['successful'] += 1
+                
+        except Exception as e:
+            print(f"Worker error processing seed {seed_num}: {str(e)}")
+            # Update shared progress counter - count attempted processing
+            with progress_dict.get_lock():
+                progress_dict['completed'] += 1
+                
     return worker_results

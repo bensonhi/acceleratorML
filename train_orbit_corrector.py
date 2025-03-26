@@ -123,7 +123,7 @@ def main():
     improvement = float(best_model_file.split('improvement_')[1].split('pct.pt')[0])
     logger.info(f"Loaded best model: {best_model_file} with {improvement:.2f}% improvement")
     
-    test_results = corrector.validate(test_seeds)
+    test_results = corrector.validate_parallel(test_seeds, num_workers=12)  # Use 12 worker processes
 
 
 if __name__ == "__main__":

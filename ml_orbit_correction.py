@@ -17,6 +17,7 @@ class OrbitCorrectionNN(nn.Module):
         super(OrbitCorrectionNN, self).__init__()
 
         # Calculate input size including initial corrector values
+        self.n_correctors=n_correctors
         input_size = n_elements * 2 + n_correctors
 
         self.network = nn.Sequential(
@@ -24,11 +25,7 @@ class OrbitCorrectionNN(nn.Module):
             nn.BatchNorm1d(1024),
             nn.LeakyReLU(negative_slope=0.01),
 
-            nn.Linear(1024, 512),
-            nn.BatchNorm1d(512),
-            nn.LeakyReLU(negative_slope=0.01),
-
-            nn.Linear(512, n_correctors)
+            nn.Linear(1024, n_correctors)
         )
 
         self._initialize_weights()
@@ -42,7 +39,11 @@ class OrbitCorrectionNN(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        return self.network(x)
+        initial_correctors = x[:, -self.n_correctors:]
+        delta = self.network(x)
+        out = initial_correctors + delta
+        # Add residual connections manually if not using Sequential
+        return out
 
 
 class OrbitCorrector:
@@ -127,7 +128,7 @@ class OrbitCorrector:
         return torch.FloatTensor(normalized_corrections).to(self.device)
 
 
-    def train(self, train_data, val_seeds, epochs=100, batch_size=32, augment_interval=1000):
+    def train(self, train_data, val_seeds, epochs=100, batch_size=32, augment_paitience=1000):
         """
         Train the neural network with normalized data and progressive augmentation
         
@@ -136,7 +137,7 @@ class OrbitCorrector:
             val_seeds: Seeds for validation
             epochs: Total number of epochs
             batch_size: Batch size for training
-            augment_interval: Interval (in epochs) to check for augmentation
+            augment_paitience: Interval (in epochs) to check for augmentation
         """
         # First fit the scalers on training data
         self.fit_scalers(train_data)
@@ -149,9 +150,9 @@ class OrbitCorrector:
         best_model_path = None
         
         # For tracking augmentation status
-        last_augmentation_epoch = 0
         augmentation_counter = 0
         has_improved_since_last_augmentation = False
+        last_improvement_epoch=0
         
         # Current training data - will grow over time
         current_train_data = train_data.copy()
@@ -193,7 +194,7 @@ class OrbitCorrector:
             if(epoch+1)%50==0:
                 self.model.eval()
                 with torch.no_grad():
-                    val_results = self.validate(val_seeds)
+                    val_results = self.validate(val_seeds, augmentation_counter+1)
                     
                     # Calculate average validation metrics
                     avg_loss_improvement = np.mean([r['loss_improvement'] for r in val_results])
@@ -205,12 +206,13 @@ class OrbitCorrector:
                         self.save_model_and_scalers(model_path)
                         best_model_path = model_path
                         has_improved_since_last_augmentation = True
+                        last_improvement_epoch=epoch
                         print(f"New best loss improvement model saved: {avg_loss_improvement:.2f}%")
                     
                     val_losses.append(avg_loss_improvement)
             
             # Check for data augmentation every augment_interval epochs
-            if (epoch + 1) % augment_interval == 0:
+            if epoch-last_improvement_epoch > augment_paitience:
                 # Only augment if we've found a better model since the last augmentation
                 if has_improved_since_last_augmentation and best_model_path is not None:
                     print(f"=== Augmenting training data at epoch {epoch+1} ===")
@@ -295,7 +297,7 @@ class OrbitCorrector:
         
         print(f"Model and scalers loaded from {filepath}")
 
-    def validate(self, val_seeds):
+    def validate(self, val_seeds, iteration=1):
         """Test trained model on test seeds and calculate losses using multiprocessing"""
         import multiprocessing
         
@@ -303,7 +305,7 @@ class OrbitCorrector:
         multiprocessing.set_start_method('spawn', force=True)
         
         # Prepare arguments for parallel processing
-        worker_args = [(seed_num, self) for seed_num in val_seeds]
+        worker_args = [(seed_num, self, iteration) for seed_num in val_seeds]
         
         # Use multiprocessing to validate seeds in parallel
         with multiprocessing.Pool(processes=os.cpu_count()) as pool:
@@ -509,7 +511,7 @@ def _augment_worker_process(args):
 # Add this function at module level for multiprocessing
 def _validate_worker(args):
     """Worker function for parallel validation processing"""
-    seed_num, corrector = args
+    seed_num, corrector, iteration = args
     
     try:
         # Load pre and post correction rings
@@ -522,19 +524,21 @@ def _validate_worker(args):
         initial_rms = utils.rms(np.concatenate(T0))
         initial_loss = utils.rms(B0)
 
-        # Get current trajectory
-        initial_hcm = utils.getCorrectorStrengths(pre_ring, 'x')
-        initial_vcm = utils.getCorrectorStrengths(pre_ring, 'y')
-        initial_correctors = np.concatenate([initial_hcm, initial_vcm])
+        for i in range(iteration):
+            [B0, T0] = utils.getBPMreading(pre_ring)
+            # Get current trajectory
+            initial_hcm = utils.getCorrectorStrengths(pre_ring, 'x')
+            initial_vcm = utils.getCorrectorStrengths(pre_ring, 'y')
+            initial_correctors = np.concatenate([initial_hcm, initial_vcm])
 
-        # Get model predictions for corrector settings
-        predicted_corrections = corrector.predict_corrections(B0, initial_correctors)
+            # Get model predictions for corrector settings
+            predicted_corrections = corrector.predict_corrections(B0, initial_correctors)
 
-        # Apply predicted corrections
-        pre_ring = utils.setCorrectorStrengths(pre_ring, 'x',
-                                                predicted_corrections[:len(corrector.hcm)])
-        pre_ring = utils.setCorrectorStrengths(pre_ring, 'y',
-                                                predicted_corrections[len(corrector.hcm):])
+            # Apply predicted corrections
+            pre_ring = utils.setCorrectorStrengths(pre_ring, 'x',
+                                                    predicted_corrections[:len(corrector.hcm)])
+            pre_ring = utils.setCorrectorStrengths(pre_ring, 'y',
+                                                    predicted_corrections[len(corrector.hcm):])
 
         # Measure new state
         [B_new, T_new] = utils.getBPMreading(pre_ring)
